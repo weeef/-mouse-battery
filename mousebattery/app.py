@@ -221,6 +221,18 @@ class App:
         TaskbarWidget(self).run()
 
 
+_instance_mutex = None
+
+
+def already_running():
+    """True when another copy (exe or script) is already running for this user."""
+    global _instance_mutex
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    _instance_mutex = kernel32.CreateMutexW(None, False, "Local\\MouseBattery.SingleInstance")
+    return kernel32.GetLastError() == 183                    # ERROR_ALREADY_EXISTS
+
+
 def main():
     if DEBUG:
         print("Looking for supported mice (move the mouse so it is awake)...")
@@ -230,6 +242,11 @@ def main():
                                    f"{r.level}%{' (charging)' if r.charging else ''}"))
         if not readings:
             print("No supported mouse receiver found.")
+        return
+    if already_running():
+        ctypes.windll.user32.MessageBoxW(
+            None, f"{APP_NAME} is already running.\n\nLook for the battery widget on the taskbar "
+                  "or the mouse icon in the tray.", APP_NAME, 0x40)
         return
     try:                                  # sharp text and the real tray icon size
         ctypes.windll.user32.SetProcessDPIAware()
