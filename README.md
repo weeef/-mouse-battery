@@ -12,6 +12,7 @@ same thin outline style as the Windows 11 tray icons:
 - Several supported mice plugged in at once are shown side by side.
 - Hides itself while a fullscreen game or video is in front.
 - A small tray icon is kept for the menu and notifications.
+- A single ~0.5 MB native exe written in Rust; no runtime to install. Only one copy runs at a time.
 
 ## Supported mice
 
@@ -25,40 +26,49 @@ The Attack Shark only reports its battery while it is awake (about every 2-4 sec
 move the mouse if it shows `--%`. Its level comes in 10% steps. While it charges on the
 cable the dongle goes quiet, so the last level is shown in blue.
 
-## Setup (Windows 10/11)
+## Use
 
-1. Install Python 3.10+ from [python.org](https://www.python.org/) and tick
-   **Add python.exe to PATH**.
-2. Double-click `run.bat`.
-3. The widget appears on the taskbar next to the tray icons. **Drag** it to move it,
+1. Run `MouseBattery.exe`.
+2. The widget appears on the taskbar next to the tray icons. **Drag** it to move it,
    **double-click** to refresh, **right-click** for the menu.
-4. Right-click the tray icon and tick **Start with Windows**.
+3. Right-click it (or the tray icon) and tick **Start with Windows**.
 
-### Standalone .exe
+## Build
 
-`build_exe.bat` builds `dist\MouseBattery.exe`, which runs without Python. Start it
-once and tick **Start with Windows** in its tray menu.
+Install [Rust](https://rustup.rs) (MSVC toolchain, which needs the Visual Studio C++ build
+tools), then run `build_exe.bat`, or:
+
+```
+cargo build --release
+```
+
+The exe is `target\release\MouseBattery.exe`; `build_exe.bat` also copies it to `dist\`.
+Run the parser tests with `cargo test`.
 
 ## Not working?
 
 - Close the mouse's own software / web driver first; it can keep the receiver busy.
-- Run `debug.bat` and move the mouse while it runs. It lists the receivers it finds and
-  the raw reports it receives, so please include that output when opening an issue.
+- Run `debug.bat` (or `MouseBattery.exe --debug` from a terminal) and move the mouse while
+  it runs. It lists the receivers it finds and the raw reports it receives, so please
+  include that output when opening an issue.
 
 ## Adding a mouse
 
-Each mouse family is a small reader function in [`mousebattery/devices.py`](mousebattery/devices.py)
-that returns `Reading(key, name, level, charging)`. Add one and list it in `READERS`.
+Each mouse family is a reader function in [`src/devices.rs`](src/devices.rs) that returns
+`Reading { key, name, level, charging }`. Add one and call it from `read_all`.
 
 ## Project layout
 
 ```
-mouse_battery.pyw        entry point
-mousebattery/
-  app.py                 tray icon, polling, notifications, start with Windows
-  devices.py             HID battery readers for each mouse
-  widget.py              taskbar widget and tray icon drawing
-  common.py              settings, logging, config file
+src/
+  main.rs        entry point, --debug mode, single-instance check
+  ui.rs          widget window, tray icon, menu, polling thread
+  devices.rs     HID battery readers for each mouse
+  state.rs       per-mouse state, low/full notifications
+  render.rs      widget and tray icon drawing
+  win.rs         Win32 helpers
+  config.rs      settings file
+  startup.rs     "Start with Windows"
 ```
 
 Settings (widget position, visibility) live in `%APPDATA%\MouseBattery\settings.json`.
