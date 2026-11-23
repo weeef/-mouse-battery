@@ -9,6 +9,8 @@ same thin outline style as the Windows 11 tray icons:
 
 - White normally, **red** at 15% or below (with a notification), **blue** while charging
   (notification at 100%), **grey** while the mouse is asleep (last known value).
+- The Beast X family reports 100% as soon as the cable goes in, so while charging the level
+  is estimated from the last unplugged reading (about 90 minutes for a full charge).
 - Several supported mice plugged in at once are shown side by side.
 - Hides itself while a fullscreen game or video is in front.
 - A small tray icon is kept for the menu and notifications.

@@ -1,11 +1,66 @@
 //! Battery state per mouse, with low-battery and fully-charged alerts.
 
 use crate::devices::Reading;
-use std::time::{Duration, Instant};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const POLL: Duration = Duration::from_secs(60);
 pub const LOW_BATTERY: u8 = 15;
 const STALE: Duration = Duration::from_secs(30 * 60);
+/// Some mice (the WLmouse Beast X family) report 100% as soon as the cable goes in, so
+/// while charging the level is estimated from the last unplugged reading at this rate.
+const FULL_CHARGE_MINUTES: f64 = 90.0;
+
+/// What is remembered across restarts, so a charge in progress keeps its estimate.
+#[derive(Serialize, Deserialize, Clone, Copy, Default, Debug, PartialEq)]
+struct Saved {
+    /// Last level reported while not charging.
+    #[serde(default)]
+    unplugged: Option<u8>,
+    /// Level the current charge started from, and when (unix seconds).
+    #[serde(default)]
+    charge: Option<(u8, u64)>,
+}
+
+fn saved_path() -> PathBuf {
+    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    base.join("MouseBattery").join("battery.json")
+}
+
+fn load_saved(key: &str) -> Saved {
+    std::fs::read_to_string(saved_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<HashMap<String, Saved>>(&s).ok())
+        .and_then(|m| m.get(key).copied())
+        .unwrap_or_default()
+}
+
+fn store_saved(key: &str, saved: Saved) {
+    let p = saved_path();
+    let mut all: HashMap<String, Saved> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    all.insert(key.to_string(), saved);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&all) {
+        let _ = std::fs::write(&p, s);
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Estimated level `secs` seconds into a charge that started at `base`.
+pub fn estimate(base: u8, secs: u64) -> u8 {
+    let gained = secs as f64 / 60.0 * 100.0 / FULL_CHARGE_MINUTES;
+    (base as f64 + gained).min(100.0) as u8
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Entry {
@@ -16,25 +71,68 @@ pub struct Entry {
 
 pub struct Mouse {
     pub name: String,
+    key: &'static str,
+    saved: Saved,
     last: Option<(u8, bool, Instant)>,
     warned_low: bool,
     warned_full: bool,
 }
 
 impl Mouse {
-    fn new(name: &str) -> Mouse {
-        Mouse { name: name.to_string(), last: None, warned_low: false, warned_full: false }
+    fn new(key: &'static str, name: &str) -> Mouse {
+        Mouse {
+            name: name.to_string(),
+            key,
+            saved: load_saved(key),
+            last: None,
+            warned_low: false,
+            warned_full: false,
+        }
+    }
+
+    fn set_saved(&mut self, saved: Saved) {
+        if saved != self.saved {
+            self.saved = saved;
+            store_saved(self.key, saved);
+        }
+    }
+
+    /// Turns the raw reading into the level to show, tracking charge sessions.
+    fn charge_level(&mut self, reported: Option<u8>, charging: bool) -> Option<u8> {
+        let mut saved = self.saved;
+        let shown = if charging {
+            if saved.charge.is_none() {
+                // no unplugged reading to start from yet: trust the mouse
+                let Some(base) = saved.unplugged.or(reported) else { return reported };
+                saved.charge = Some((base.min(reported.unwrap_or(100)), now_secs()));
+            }
+            let (base, start) = saved.charge.unwrap();
+            let est = estimate(base, now_secs().saturating_sub(start));
+            Some(reported.map_or(est, |r| r.min(est)))
+        } else {
+            if let Some((base, start)) = saved.charge.take() {
+                // cable came out: carry the estimate over until the mouse reports again
+                saved.unplugged = Some(estimate(base, now_secs().saturating_sub(start)));
+            }
+            if reported.is_some() {
+                saved.unplugged = reported;
+            }
+            reported
+        };
+        self.set_saved(saved);
+        shown
     }
 
     fn update(&mut self, r: &Reading, notes: &mut Vec<String>) {
         if !r.name.is_empty() {
             self.name = r.name.clone();
         }
-        let Some(level) = r.level else {
-            match self.last {
-                Some((lvl, _, _)) if r.charging => self.last = Some((lvl, true, Instant::now())), // quiet on the cable
-                Some((_, _, t)) if t.elapsed() >= STALE => self.last = None,
-                _ => {}
+        let level = self.charge_level(r.level, r.charging);
+        let Some(level) = level.filter(|_| r.level.is_some() || r.charging) else {
+            if let Some((_, _, t)) = self.last {
+                if t.elapsed() >= STALE {
+                    self.last = None;
+                }
             }
             return;
         };
@@ -67,7 +165,9 @@ impl Mouse {
         match self.last {
             None => format!("{}: waiting for the mouse (move it to wake it)", self.name),
             Some((level, charging, _)) => {
-                let state = if charging {
+                let state = if charging && level < 100 {
+                    " - charging (estimated)"
+                } else if charging {
                     " - charging"
                 } else if self.asleep() {
                     " (asleep, last reading)"
@@ -95,7 +195,7 @@ impl AppState {
             let i = match self.mice.iter().position(|(k, _)| *k == r.key) {
                 Some(i) => i,
                 None => {
-                    self.mice.push((r.key, Mouse::new(&r.name)));
+                    self.mice.push((r.key, Mouse::new(r.key, &r.name)));
                     self.mice.len() - 1
                 }
             };
@@ -124,5 +224,18 @@ impl AppState {
         let lowest = shown.iter().min_by_key(|m| m.last.unwrap().0).unwrap();
         let tip = shown.iter().map(|m| m.text()).collect::<Vec<_>>().join("\n");
         (tip, lowest.entry())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn charge_estimate() {
+        assert_eq!(estimate(60, 0), 60);
+        assert_eq!(estimate(60, 5 * 60), 65);
+        assert_eq!(estimate(60, 45 * 60), 100);
+        assert_eq!(estimate(0, 45 * 60), 50);
     }
 }
