@@ -10,6 +10,14 @@
 //!   * the 2.4G dongle (PID 0xFA60) pushes an input report every few seconds while the mouse
 //!     is awake, no request needed:  03 xx 40 01 <level>   (level 1-10 = 10%-100%)
 //!   * with the USB-C cable plugged in the mouse also shows up as PID 0xFA61 -> charging
+//!
+//! Pulsar X2H / X2 V2 / X2A, VID 0x3554 - from the Linux hid-pulsar driver:
+//!   * vendor collection FF02:0002 on interface 1, 17-byte output/input reports, id 0x08
+//!   * request: 08 <cmd> 00.. <checksum>, checksum = 0x55 - sum(bytes 0..15)
+//!   * 0x01 info   -> bytes 6-7 model (0x060C/0x060D = X2H); answered even with the mouse off
+//!   * 0x03 status -> byte 6: 1 = mouse connected, 0 = off / out of range
+//!   * 0x04 power  -> byte 6 battery %, byte 7 = 1 on the cable
+//!   * PIDs: 0xF508 1 kHz dongle, 0xF509 4 kHz dongle, 0xF507 cable
 
 use hidapi::HidApi;
 use std::ffi::CString;
@@ -273,6 +281,121 @@ fn read_attack_shark(api: &HidApi) -> Vec<Reading> {
     vec![Reading { key: "attackshark", name: "Attack Shark X3".into(), level, charging: wired }]
 }
 
+// ------------------------------------------------------------------ Pulsar (X2H, X2 V2, X2A, ...)
+
+const PULSAR_VID: u16 = 0x3554;
+const PULSAR_DONGLE_PIDS: [u16; 2] = [0xF508, 0xF509]; // 1 kHz, 4 kHz
+const PULSAR_WIRED_PIDS: [u16; 1] = [0xF507];
+const PULSAR_INFO: u8 = 0x01;
+const PULSAR_STATUS: u8 = 0x03;
+const PULSAR_POWER: u8 = 0x04;
+
+fn pulsar_checksum(r: &[u8]) -> u8 {
+    0x55u8.wrapping_sub(r[..16].iter().fold(0u8, |s, b| s.wrapping_add(*b)))
+}
+
+pub fn pulsar_request(cmd: u8) -> [u8; 17] {
+    let mut r = [0u8; 17];
+    r[0] = 0x08;
+    r[1] = cmd;
+    if cmd == PULSAR_INFO {
+        r[5] = 8; // all-zero challenge, so the reply carries the device id as is
+    }
+    r[16] = pulsar_checksum(&r);
+    r
+}
+
+fn pulsar_valid(r: &[u8], cmd: u8) -> bool {
+    r.len() >= 17 && r[0] == 0x08 && r[1] == cmd && r[16] == pulsar_checksum(r)
+}
+
+/// Power reply: byte 6 = battery %, byte 7 = 1 while on the cable.
+pub fn pulsar_parse_power(r: &[u8]) -> Option<(u8, bool)> {
+    if pulsar_valid(r, PULSAR_POWER) && r[6] <= 100 && r[7] <= 1 {
+        return Some((r[6], r[7] == 1));
+    }
+    None
+}
+
+pub fn pulsar_name(info: &[u8]) -> &'static str {
+    if !pulsar_valid(info, PULSAR_INFO) {
+        return "Pulsar";
+    }
+    match u16::from_be_bytes([info[6], info[7]]) {
+        0x060C | 0x060D => "Pulsar X2H",
+        _ => "Pulsar",
+    }
+}
+
+/// Send one command and wait for its reply (the receiver answers within ~100 ms).
+fn pulsar_cmd(dev: &hidapi::HidDevice, cmd: u8) -> Option<[u8; 17]> {
+    let mut buf = [0u8; 64];
+    while matches!(dev.read(&mut buf), Ok(n) if n > 0) {} // drop stale reports
+    if let Err(e) = dev.write(&pulsar_request(cmd)) {
+        dlog!("   write failed: {e}");
+        return None;
+    }
+    let end = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < end {
+        if let Ok(n) = dev.read(&mut buf) {
+            if n > 0 {
+                dlog!("   report: {}", hex(&buf[..n]));
+                if pulsar_valid(&buf[..n], cmd) {
+                    let mut r = [0u8; 17];
+                    r.copy_from_slice(&buf[..17]);
+                    return Some(r);
+                }
+            }
+        }
+        sleep(Duration::from_millis(10));
+    }
+    None
+}
+
+fn read_pulsar(api: &HidApi) -> Vec<Reading> {
+    let infos: Vec<Info> = enumerate(api, PULSAR_VID)
+        .into_iter()
+        .filter(|d| PULSAR_DONGLE_PIDS.contains(&d.pid) || PULSAR_WIRED_PIDS.contains(&d.pid))
+        .filter(|d| d.usage_page == 0xFF02 && d.usage == 0x0002)
+        .collect();
+    if infos.is_empty() {
+        return vec![];
+    }
+    // the cable connection first: when it is there the mouse is charging on it
+    let mut order: Vec<&Info> = infos.iter().collect();
+    order.sort_by_key(|d| if PULSAR_WIRED_PIDS.contains(&d.pid) { 0 } else { 1 });
+
+    let mut name = "Pulsar";
+    for d in order {
+        dlog!("  asking {:04x} usage={:04x}:{:04x}", d.pid, d.usage_page, d.usage);
+        let dev = match api.open_path(&d.path) {
+            Ok(dev) => dev,
+            Err(e) => {
+                dlog!("   open failed: {e}");
+                continue;
+            }
+        };
+        let _ = dev.set_blocking_mode(false);
+        if let Some(info) = pulsar_cmd(&dev, PULSAR_INFO) {
+            name = pulsar_name(&info);
+        }
+        // status byte 6: 1 = mouse connected to the receiver, 0 = off / out of range
+        match pulsar_cmd(&dev, PULSAR_STATUS) {
+            Some(s) if s[6] == 1 => {}
+            Some(_) => {
+                dlog!("   mouse not connected");
+                continue;
+            }
+            None => continue,
+        }
+        if let Some((level, cable)) = pulsar_cmd(&dev, PULSAR_POWER).and_then(|r| pulsar_parse_power(&r)) {
+            let charging = cable || PULSAR_WIRED_PIDS.contains(&d.pid);
+            return vec![Reading { key: "pulsar", name: name.into(), level: Some(level), charging }];
+        }
+    }
+    vec![Reading { key: "pulsar", name: name.into(), level: None, charging: false }]
+}
+
 // ------------------------------------------------------------------ all mice
 
 pub fn read_all(api: &mut HidApi) -> Vec<Reading> {
@@ -281,6 +404,7 @@ pub fn read_all(api: &mut HidApi) -> Vec<Reading> {
     }
     let mut readings = read_wlmouse(api);
     readings.extend(read_attack_shark(api));
+    readings.extend(read_pulsar(api));
     readings
 }
 
@@ -303,5 +427,23 @@ mod tests {
         assert_eq!(wl_parse_feature(&[0xA1, 0, 2, 2, 0, 0x83, 1, 93]), Some((93, true)));
         assert_eq!(wl_parse_heartbeat(&[0x03, 0x00, 80, 0]), Some((80, false)));
         assert_eq!(wl_name(0x1234, "WLMOUSE Foo 8K Receiver"), "Foo");
+    }
+
+    #[test]
+    fn pulsar() {
+        assert_eq!(pulsar_request(PULSAR_POWER)[16], 0x49);
+        assert_eq!(pulsar_request(PULSAR_STATUS)[16], 0x4A);
+        assert_eq!(pulsar_request(PULSAR_INFO)[16], 0x44);
+        // captured from an X2H receiver with the mouse switched off
+        let info = [8, 1, 0, 0, 0, 8, 6, 0x0c, 0, 0, 6, 0x0c, 0, 0, 0, 0, 0x20];
+        assert_eq!(pulsar_name(&info), "Pulsar X2H");
+        let mut power = [8u8, 4, 0, 0, 0, 2, 73, 0, 0x0f, 0xa0, 0, 0, 0, 0, 0, 0, 0];
+        power[16] = pulsar_checksum(&power);
+        assert_eq!(pulsar_parse_power(&power), Some((73, false)));
+        power[7] = 1;
+        power[16] = pulsar_checksum(&power);
+        assert_eq!(pulsar_parse_power(&power), Some((73, true)));
+        power[16] ^= 1;
+        assert_eq!(pulsar_parse_power(&power), None);
     }
 }
