@@ -2,7 +2,8 @@
 
 use crate::render::{Canvas, Rgb};
 use std::ptr::{null, null_mut};
-use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND, POINT, RECT};
+use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateBitmap, CreateDIBSection, DeleteObject, GetDC, GetPixel, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER,
     BI_RGB, DIB_RGB_COLORS,
@@ -31,13 +32,24 @@ pub fn attach_console() {
     }
 }
 
-/// True when another copy is already running for this user. The mutex is kept for the
-/// lifetime of the process on purpose.
-pub fn already_running() -> bool {
+/// True when another copy is still running for this user after waiting up to `wait` for
+/// it to exit (used right after an update). The mutex is kept for the lifetime of the
+/// process on purpose.
+pub fn already_running(wait: Duration) -> bool {
     let name = wide("Local\\MouseBattery.SingleInstance");
-    unsafe {
-        let handle = CreateMutexW(null(), 0, name.as_ptr());
-        !handle.is_null() && GetLastError() == ERROR_ALREADY_EXISTS
+    let end = Instant::now() + wait;
+    loop {
+        unsafe {
+            let handle = CreateMutexW(null(), 0, name.as_ptr());
+            if handle.is_null() || GetLastError() != ERROR_ALREADY_EXISTS {
+                return false;
+            }
+            CloseHandle(handle);
+        }
+        if Instant::now() >= end {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 

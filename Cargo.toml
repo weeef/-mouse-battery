@@ -1,6 +1,6 @@
 [package]
 name = "mouse-battery"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 description = "Wireless mouse battery level on the Windows taskbar"
 publish = false
@@ -21,6 +21,7 @@ version = "0.59"
 features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Networking_WinHttp",
     "Win32_Security",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",

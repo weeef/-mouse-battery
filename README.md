@@ -23,6 +23,7 @@ same thin outline style as the Windows 11 tray icons:
 | WLmouse Beast X Mini Pro | `36A7:A868` | Tested |
 | WLmouse Beast X / Beast X Max | `36A7:A887` / `36A7:A880` | Same protocol, untested |
 | Attack Shark X3 | `1D57:FA60` (dongle), `1D57:FA61` (cable) | Community protocol, untested |
+| Pulsar X2H (also X2 V2 / X2A) | `3554:F508` / `3554:F509` (dongle), `3554:F507` (cable) | Receiver tested, battery reply untested |
 
 The Attack Shark only reports its battery while it is awake (about every 2-4 seconds), so
 move the mouse if it shows `--%`. Its level comes in 10% steps. While it charges on the
@@ -35,10 +36,27 @@ cable the dongle goes quiet, so the last level is shown in blue.
    **double-click** to refresh, **right-click** for the menu.
 3. Right-click it (or the tray icon) and tick **Start with Windows**.
 
+## Updating
+
+The app checks this repo's GitHub Releases shortly after it starts and then once a day.
+When a newer version is out you get a notification, and the menu shows
+**Update to version X**. Click it and the app downloads the new exe, swaps it in and
+restarts itself. **Check for updates** in the same menu checks right away.
+
+To publish an update:
+
+1. Bump `version` in `Cargo.toml` (for example `2.1.0` -> `2.2.0`) and run `build_exe.bat`.
+2. Create a GitHub release tagged `v2.2.0` and attach `dist\MouseBattery.exe` under
+   exactly that name. Releases marked as drafts or pre-releases are ignored.
+
+The exe has to sit in a folder you can write to (not `Program Files`) for the swap to work.
+
 ## Build
 
-Install [Rust](https://rustup.rs) (MSVC toolchain, which needs the Visual Studio C++ build
-tools), then run `build_exe.bat`, or:
+Install [Rust](https://rustup.rs) with either the MSVC toolchain (needs the Visual Studio
+C++ build tools) or the GNU toolchain plus a full MinGW-w64 on `PATH`
+(`winget install BrechtSanders.WinLibs.POSIX.UCRT`, then
+`rustup default stable-x86_64-pc-windows-gnu`). Then run `build_exe.bat`, or:
 
 ```
 cargo build --release
@@ -71,6 +89,7 @@ src/
   win.rs         Win32 helpers
   config.rs      settings file
   startup.rs     "Start with Windows"
+  update.rs      update check / download from GitHub Releases
 ```
 
 Settings (widget position, visibility) live in `%APPDATA%\MouseBattery\settings.json`.
@@ -79,5 +98,6 @@ Settings (widget position, visibility) live in `%APPDATA%\MouseBattery\settings.
 
 Protocol details come from community reverse engineering:
 - WLmouse: HaloBattery (MIT)
+- Pulsar: the Linux kernel `hid-pulsar` driver
 - Attack Shark X3: [x3ctl](https://github.com/Elektrik1/x3ctl) and
   [attack-shark-mac-battery](https://github.com/renato-minuar/attack-shark-mac-battery)

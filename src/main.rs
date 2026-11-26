@@ -2,6 +2,7 @@
 //!
 //! Run normally:          MouseBattery.exe
 //! One-shot check:        MouseBattery.exe --debug
+//! (MouseBattery.exe --updated is how a finished update restarts the app.)
 
 #![windows_subsystem = "windows"]
 
@@ -25,6 +26,7 @@ mod render;
 mod startup;
 mod state;
 mod ui;
+mod update;
 mod win;
 
 pub const APP_NAME: &str = "Mouse Battery";
@@ -36,16 +38,22 @@ fn main() {
         debug_check();
         return;
     }
-    if win::already_running() {
-        win::message_box(
-            APP_NAME,
-            "Mouse Battery is already running.\n\nLook for the battery widget on the taskbar or the mouse icon in the tray.",
-        );
+    // right after an update the old copy is still shutting down
+    let updated = std::env::args().any(|a| a == "--updated");
+    let wait = std::time::Duration::from_secs(if updated { 10 } else { 0 });
+    if win::already_running(wait) {
+        if !updated {
+            win::message_box(
+                APP_NAME,
+                "Mouse Battery is already running.\n\nLook for the battery widget on the taskbar or the mouse icon in the tray.",
+            );
+        }
         return;
     }
+    std::thread::spawn(update::cleanup);
     win::set_dpi_aware();
     startup::migrate();
-    ui::run();
+    ui::run(updated);
 }
 
 fn debug_check() {

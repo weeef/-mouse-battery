@@ -4,11 +4,13 @@
 use crate::config::Config;
 use crate::render::{self, Canvas, Rgb};
 use crate::state::{AppState, Entry, POLL};
+use crate::update::{self, Release};
 use crate::{devices, startup, win, APP_NAME};
 use std::cell::RefCell;
 use std::ptr::{null, null_mut};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, SetDIBitsToDevice, DIB_RGB_COLORS, PAINTSTRUCT};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -29,13 +31,95 @@ const CMD_TOGGLE_WIDGET: usize = 2;
 const CMD_TOGGLE_STARTUP: usize = 3;
 const CMD_RESET_POSITION: usize = 4;
 const CMD_QUIT: usize = 5;
+const CMD_CHECK_UPDATE: usize = 6;
+const CMD_INSTALL_UPDATE: usize = 7;
+
+const WM_APP_UPDATER: u32 = WM_APP + 3;
+const UPDATE_FIRST_CHECK: Duration = Duration::from_secs(20);
+const UPDATE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 type DrawKey = (Vec<Entry>, Rgb, usize);
+
+/// Shared between the UI and the update threads.
+#[derive(Default)]
+struct Updater {
+    available: Option<Release>,
+    busy: bool,
+    /// Version already announced, so the daily check does not repeat itself.
+    announced: Option<String>,
+    notes: Vec<String>,
+    quit: bool,
+}
+
+fn post_updater(hwnd: isize) {
+    unsafe { PostMessageW(hwnd as HWND, WM_APP_UPDATER, 0, 0) };
+}
+
+/// Look for a newer release. `manual` also reports "up to date" and errors.
+fn check_for_update(updater: &Arc<Mutex<Updater>>, hwnd: isize, manual: bool) {
+    {
+        let mut u = updater.lock().unwrap();
+        if u.busy {
+            return;
+        }
+        u.busy = true;
+    }
+    let result = update::check();
+    let mut u = updater.lock().unwrap();
+    u.busy = false;
+    match result {
+        Ok(Some(r)) => {
+            if manual || u.announced.as_deref() != Some(r.version.as_str()) {
+                u.notes.push(format!(
+                    "Version {} is available. Right-click the widget and choose \"Update to {}\".",
+                    r.version, r.version
+                ));
+                u.announced = Some(r.version.clone());
+            }
+            u.available = Some(r);
+        }
+        Ok(None) => {
+            u.available = None;
+            if manual {
+                u.notes.push(format!("You have the latest version ({}).", update::CURRENT));
+            }
+        }
+        Err(e) => {
+            dlog!("update check failed: {e}");
+            if manual {
+                u.notes.push(format!("Could not check for updates: {e}."));
+            }
+        }
+    }
+    drop(u);
+    post_updater(hwnd);
+}
+
+fn install_update(updater: &Arc<Mutex<Updater>>, hwnd: isize) {
+    let release = {
+        let mut u = updater.lock().unwrap();
+        let Some(r) = u.available.clone().filter(|_| !u.busy) else { return };
+        u.busy = true;
+        u.notes.push(format!("Downloading version {}...", r.version));
+        r
+    };
+    post_updater(hwnd);
+    let result = update::install(&release);
+    let mut u = updater.lock().unwrap();
+    u.busy = false;
+    match result {
+        Ok(()) => u.quit = true,
+        Err(e) => u.notes.push(format!("Update failed: {e}.")),
+    }
+    drop(u);
+    post_updater(hwnd);
+}
 
 struct Ui {
     hwnd: HWND,
     state: Arc<Mutex<AppState>>,
     refresh: Sender<()>,
+    updater: Arc<Mutex<Updater>>,
     cfg: Config,
     scale: f32,
     bg: Rgb,
@@ -57,8 +141,9 @@ fn with_ui<R>(f: impl FnOnce(&mut Ui) -> R) -> Option<R> {
     UI.with(|cell| cell.try_borrow_mut().ok().and_then(|mut ui| ui.as_mut().map(f)))
 }
 
-pub fn run() {
+pub fn run(just_updated: bool) {
     let state = Arc::new(Mutex::new(AppState::default()));
+    let updater = Arc::new(Mutex::new(Updater::default()));
     let (tx, rx) = mpsc::channel::<()>();
 
     let hwnd = unsafe { create_window() };
@@ -91,12 +176,26 @@ pub fn run() {
         });
     }
 
+    // update check shortly after start, then once a day
+    {
+        let updater = updater.clone();
+        let target = hwnd as isize;
+        std::thread::spawn(move || {
+            std::thread::sleep(UPDATE_FIRST_CHECK);
+            loop {
+                check_for_update(&updater, target, false);
+                std::thread::sleep(UPDATE_EVERY);
+            }
+        });
+    }
+
     let taskbar_created = unsafe { RegisterWindowMessageW(win::wide("TaskbarCreated").as_ptr()) };
     UI.with(|cell| {
         *cell.borrow_mut() = Some(Ui {
             hwnd,
             state,
             refresh: tx,
+            updater,
             cfg: Config::load(),
             scale: win::dpi_scale(),
             bg: (32, 32, 32),
@@ -112,6 +211,9 @@ pub fn run() {
     with_ui(|ui| {
         ui.update_tray(NIM_ADD);
         ui.update_widget();
+        if just_updated {
+            ui.notify(&format!("Updated to version {}.", update::CURRENT));
+        }
     });
     unsafe {
         SetTimer(hwnd, TIMER_ID, 1000, None);
@@ -325,10 +427,42 @@ impl Ui {
         self.forget_position_cache();
     }
 
+    fn on_updater(&mut self) {
+        let (notes, quit) = {
+            let mut u = self.updater.lock().unwrap();
+            (std::mem::take(&mut u.notes), u.quit)
+        };
+        for note in notes {
+            self.notify(&note);
+        }
+        if quit {
+            self.run_command(CMD_QUIT); // the new version is already starting
+        }
+    }
+
+    fn spawn_updater(&self, install: bool) {
+        let updater = self.updater.clone();
+        let target = self.hwnd as isize;
+        std::thread::spawn(move || {
+            if install {
+                install_update(&updater, target);
+            } else {
+                check_for_update(&updater, target, true);
+            }
+        });
+    }
+
     // ---------------------------------------------------------------- menu
 
-    fn menu_lines(&self) -> (Vec<String>, bool) {
-        (self.state.lock().unwrap().status_lines(), self.cfg.visible)
+    fn menu_info(&self) -> MenuInfo {
+        let u = self.updater.lock().unwrap();
+        let update = match (&u.available, u.busy) {
+            (Some(_), true) => ("Downloading update...".to_string(), 0),
+            (None, true) => ("Checking for updates...".to_string(), 0),
+            (Some(r), false) => (format!("Update to version {}", r.version), CMD_INSTALL_UPDATE),
+            (None, false) => ("Check for updates".to_string(), CMD_CHECK_UPDATE),
+        };
+        MenuInfo { lines: self.state.lock().unwrap().status_lines(), visible: self.cfg.visible, update }
     }
 
     fn run_command(&mut self, cmd: usize) {
@@ -348,6 +482,8 @@ impl Ui {
                 self.forget_position_cache();
                 self.update_widget();
             }
+            CMD_CHECK_UPDATE => self.spawn_updater(false),
+            CMD_INSTALL_UPDATE => self.spawn_updater(true),
             CMD_QUIT => unsafe {
                 Shell_NotifyIconW(NIM_DELETE, &self.nid());
                 DestroyWindow(self.hwnd);
@@ -357,9 +493,16 @@ impl Ui {
     }
 }
 
+struct MenuInfo {
+    lines: Vec<String>,
+    visible: bool,
+    /// Label and command of the update item (command 0 = greyed out).
+    update: (String, usize),
+}
+
 /// Shows the menu without holding the UI borrow (the menu runs its own message loop).
 fn show_menu(hwnd: HWND) {
-    let Some((lines, visible)) = with_ui(|ui| ui.menu_lines()) else { return };
+    let Some(MenuInfo { lines, visible, update }) = with_ui(|ui| ui.menu_info()) else { return };
     let cmd = unsafe {
         let menu = CreatePopupMenu();
         for line in &lines {
@@ -374,6 +517,12 @@ fn show_menu(hwnd: HWND) {
         item(CMD_TOGGLE_WIDGET, "Show on taskbar", visible);
         item(CMD_TOGGLE_STARTUP, "Start with Windows", startup::enabled());
         item(CMD_RESET_POSITION, "Reset widget position", false);
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        let version = format!("Version {}", update::CURRENT);
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, win::wide(&version).as_ptr());
+        let (label, id) = &update;
+        let flags = if *id == 0 { MF_STRING | MF_GRAYED } else { MF_STRING };
+        AppendMenuW(menu, flags, *id, win::wide(label).as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         item(CMD_QUIT, "Quit", false);
         SetMenuDefaultItem(menu, CMD_REFRESH as u32, 0);
@@ -403,6 +552,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_APP_UPDATE => {
             with_ui(|ui| ui.on_state_update());
+            return 0;
+        }
+        WM_APP_UPDATER => {
+            with_ui(|ui| ui.on_updater());
             return 0;
         }
         WM_APP_TRAY => {
